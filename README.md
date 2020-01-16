@@ -105,3 +105,16 @@ SNP would be counted on a specific strand. See tests for an example.
 considering the presence of partial Y chromosome. Y chromosome counts are
 provided by biometrics tool. In its absence, this metric will be NA.
 
+### GetPileupSummaries for conta
+
+* How to compile
+
+```
+gcc -o bam-gps bam-gps.c -lhts -lbam
+```
+
+* Usage
+
+```
+bam-gps -i <in.bam> -o <plp.tsv> -r <ref.fa> -R <small_exac_common_3_b37.vcf.gz>
+```
