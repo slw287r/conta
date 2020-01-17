@@ -16,8 +16,8 @@
 #include <htslib/kstring.h>
 
 #define version "0.1.0"
-#define MAX_DEP 8000
-#define MIN_DEP 30
+#define MAX_DEP 10000
+#define MIN_DEP 10
 #define MIN_MAPQ 50
 #define MIN_QLEN 30
 #define header "CHROM\tPOS\tDEPTH\tREF\tA\tC\tG\tT\tN\tINS\tDEL"
