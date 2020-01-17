@@ -18,8 +18,8 @@
 #define version "0.1.0"
 #define MAX_DEP 8000
 #define MIN_DEP 30
-#define MIN_MAPQ 20
-#define MIN_QLEN 10
+#define MIN_MAPQ 50
+#define MIN_QLEN 30
 #define header "CHROM\tPOS\tDEPTH\tREF\tA\tC\tG\tT\tN\tINS\tDEL"
 
 #define EMPTY_HASH(type, hash) do                 \
@@ -48,7 +48,7 @@ typedef struct
 typedef struct
 {
 	char *in, *out, *ref, *reg;
-	int max_dep, min_dep;
+	int max_dep, min_dep, biallelic;
 } arg_t;
 
 struct option long_options[] =
@@ -59,6 +59,7 @@ struct option long_options[] =
 	{"reg", required_argument, 0, 'R'},
 	{"max_dep", required_argument, 0, 'M'},
 	{"min_dep", required_argument, 0, 'm'},
+	{"biallelic", no_argument, 0, 'b'},
 	{"version", no_argument, 0, 'v'},
 	{"help", no_argument, 0, 'h'},
 	{0, 0, 0, 0}
@@ -75,7 +76,7 @@ void val_arg(const arg_t *);
 void _mkdir(const char *dir);
 void usage(char *s);
 int read_bam(void *data, bam1_t *b);
-void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, const int min_dep);
+void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, const int min_dep, const int biallelic);
 
 int main(int argc, char *argv[])
 {
@@ -86,7 +87,7 @@ int main(int argc, char *argv[])
 	arg->min_dep = MIN_DEP;
 	int c = 0, opt_idx = 0;
 	uint64_t required_args = 0;
-	while ((c = getopt_long(argc, argv,"i:o:r:R:M:m:vh", long_options, &opt_idx)) != -1)
+	while ((c = getopt_long(argc, argv,"i:o:r:R:M:m:bvh", long_options, &opt_idx)) != -1)
 	{
 		switch (c)
 		{
@@ -111,6 +112,9 @@ int main(int argc, char *argv[])
 				break;
 			case 'm':
 				arg->min_dep = atoi(optarg);
+				break;
+			case 'b':
+				arg->biallelic = 1;
 				break;
 			case 'v':
 				fputs(version, stderr);
@@ -148,7 +152,7 @@ int main(int argc, char *argv[])
 	data->min_len = MIN_QLEN;
 	data->min_mapq = MIN_MAPQ;
 	bam_hdr_t *h = data->hdr;
-	pileup(data, fp, fai, bed, arg->max_dep, arg->min_dep);
+	pileup(data, fp, fai, bed, arg->max_dep, arg->min_dep, arg->biallelic);
 	// infer depth
 	bam_hdr_destroy(data->hdr);
 	bam_close(data->fp);
@@ -197,6 +201,11 @@ void val_arg(const arg_t *arg)
 		error("Expecting positive depth value\n");
 	if (arg->max_dep < arg->min_dep)
 		error("Expecting larget max_dep (%d) than min_dep (%d)\n", arg->max_dep, arg->min_dep);
+}
+
+size_t count_chars(char* s, char c)
+{
+	return *s ? ((c == *s) + count_chars(s + 1, c)) : 0;
 }
 
 void _mkdir(const char *dir)
@@ -256,7 +265,7 @@ char *get_id_seq(const bam_pileup1_t *p)
 	return seq;
 }
 
-void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, const int min_dep)
+void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, const int min_dep, const int biallelic)
 {
 	khint_t k;
 	int i, l = 0, tid = 0, pos = 0, n_plp = 0, r = 0;
@@ -326,6 +335,11 @@ void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, c
 		}
 		else
 			kputs("0", &dseq);
+		if (biallelic)
+		{
+			if ((nt[0]>0) + (nt[1]>0) + (nt[2]>0) + (nt[3]>0) + count_chars(iseq.s, ':') + count_chars(dseq.s, ':') > 2)
+				goto cleanup;
+		}
 		// output info
 		char *ref = faidx_fetch_seq(fai, h->target_name[tid], pos, pos, &l);
 		fprintf(fp, "%s\t", h->target_name[tid]);
@@ -339,10 +353,11 @@ void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, c
 		fprintf(fp, "%d\t", nt[4]);
 		fprintf(fp, "%s\t", iseq.s);
 		fprintf(fp, "%s\n", dseq.s);
+		free(ref);
+cleanup:
 		EMPTY_HASH(map, mi);
 		EMPTY_HASH(map, md);
 		iseq.l = dseq.l = 0;
-		free(ref);
 	}
 	bam_mplp_destroy(mplp);
 }
@@ -353,13 +368,14 @@ void usage(char *str)
 	fprintf(stderr, "\n\033[1;2mBuild %s on %s at %s\033[0;0m\n", version, __DATE__, __TIME__);
 	fprintf(stderr, "\n\033[1mUsage\033[0m: \033[1;31m%s\033[0;0m -i <bam> -o <out> -r <ref> -R <reg>\n", basename(str));
 	fprintf(stderr, "\n  Required:\n");
-	fprintf(stderr, "    -i --in         [STR] Input bam\n");
-	fprintf(stderr, "    -o --out        [STR] Output pileup summary\n");
-	fprintf(stderr, "    -r --ref        [STR] Reference fa\n");
-	fprintf(stderr, "    -R --reg        [STR] Region of interest\n");
+	fprintf(stderr, "    -i --in         [STR]  Input bam\n");
+	fprintf(stderr, "    -o --out        [STR]  Output pileup summary\n");
+	fprintf(stderr, "    -r --ref        [STR]  Reference fa\n");
+	fprintf(stderr, "    -R --reg        [STR]  Region of interest\n");
 	fprintf(stderr, "\n  Optional:\n");
-	fprintf(stderr, "    -M --max_dep    [INT] Max depth of coverage (8000)\n");
-	fprintf(stderr, "    -m --min_dep    [INT] Min depth of coverage (10)\n");
+	fprintf(stderr, "    -M --max_dep    [INT]  Max depth of coverage (8000)\n");
+	fprintf(stderr, "    -m --min_dep    [INT]  Min depth of coverage (10)\n");
+	fprintf(stderr, "    -b --biallelic  [BOOL] Restrict alleles to biallelic (false)\n");
 	fputc('\n', stderr);
 	fprintf(stderr, "    -v --version          Show version\n");
 	fprintf(stderr, "    -h --help             Show help message\n");
