@@ -110,7 +110,7 @@ provided by biometrics tool. In its absence, this metric will be NA.
 * How to compile
 
 ```
-gcc -o bam-gps bam-gps.c -lhts -lbam
+gcc -o bam-gps bam-gps.c bedidx.c -lhts -lbam -lpthread -lz
 ```
 
 * Usage
