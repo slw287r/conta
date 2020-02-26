@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -10,17 +14,37 @@
 #include <zlib.h>
 
 #include <bam.h>
+#include <bedidx.h>
+#include <htslib/hts.h>
+#include <htslib/sam.h>
 #include <htslib/faidx.h>
 #include <htslib/kfunc.h>
 #include <htslib/khash.h>
 #include <htslib/kstring.h>
+#include <htslib/thread_pool.h>
+#include <pthread.h>
 
-#define version "0.1.0"
+#define version "0.2.0"
 #define MAX_DEP 10000
 #define MIN_DEP 10
 #define MIN_MAPQ 50
 #define MIN_QLEN 30
+#define THREAD 8
+#define PP fprintf(stderr, "%s\t%d\t<%s>\n", __FILE__, __LINE__, __func__);
 #define header "CHROM\tPOS\tDEPTH\tREF\tA\tC\tG\tT\tN\tINS\tDEL"
+static const unsigned int BAM_FILTER = (BAM_FQCFAIL | BAM_FUNMAP | BAM_FMUNMAP | BAM_FSECONDARY | BAM_FDUP);
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+	int n, m;
+	uint64_t *a;
+	int *idx;
+	int filter;
+} bed_reglist_t;
+
+KHASH_MAP_INIT_STR(reg, bed_reglist_t)
+typedef khash_t(reg) reghash_t;
+//KHASH_SET_INIT_STR(set)
 
 #define EMPTY_HASH(type, hash) do                 \
 {                                                 \
@@ -40,16 +64,27 @@ KHASH_MAP_INIT_STR(map, int)
 
 typedef struct
 {
-	bamFile fp;
+	samFile *fp;
 	bam_hdr_t *hdr;
-	int min_mapq, min_len;
+	hts_itr_t *itr;
+	hts_idx_t *idx;
+	int min_mapq, min_qlen;
 } aux_t;
 
 typedef struct
 {
 	char *in, *out, *ref, *reg;
 	int max_dep, min_dep, biallelic;
+	int thread;
 } arg_t;
+
+typedef struct
+{
+	char *reg;
+	FILE *out;
+	arg_t *arg;
+	faidx_t *fai;
+} par_t;
 
 struct option long_options[] =
 {
@@ -60,6 +95,7 @@ struct option long_options[] =
 	{"max_dep", required_argument, 0, 'M'},
 	{"min_dep", required_argument, 0, 'm'},
 	{"biallelic", no_argument, 0, 'b'},
+	{"thread", no_argument, 0, 't'},
 	{"version", no_argument, 0, 'v'},
 	{"help", no_argument, 0, 'h'},
 	{0, 0, 0, 0}
@@ -76,7 +112,7 @@ void val_arg(const arg_t *);
 void _mkdir(const char *dir);
 void usage(char *s);
 int read_bam(void *data, bam1_t *b);
-void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, const int min_dep, const int biallelic);
+void *gps(void *par);
 
 int main(int argc, char *argv[])
 {
@@ -85,9 +121,10 @@ int main(int argc, char *argv[])
 	arg_t *arg = calloc(1, sizeof(arg_t));
 	arg->max_dep = MAX_DEP;
 	arg->min_dep = MIN_DEP;
+	arg->thread = THREAD;
 	int c = 0, opt_idx = 0;
 	uint64_t required_args = 0;
-	while ((c = getopt_long(argc, argv,"i:o:r:R:M:m:bvh", long_options, &opt_idx)) != -1)
+	while ((c = getopt_long(argc, argv,"i:o:r:R:M:m:t:bvh", long_options, &opt_idx)) != -1)
 	{
 		switch (c)
 		{
@@ -112,6 +149,9 @@ int main(int argc, char *argv[])
 				break;
 			case 'm':
 				arg->min_dep = atoi(optarg);
+				break;
+			case 't':
+				arg->thread = atoi(optarg);
 				break;
 			case 'b':
 				arg->biallelic = 1;
@@ -140,22 +180,38 @@ int main(int argc, char *argv[])
 	//free(output);
 	void *bed = bed_read(arg->reg);
 	if (!bed) error("Failed to read region file %s\n", arg->reg);
+	bed_unify(bed);
 	FILE *fp = fopen(arg->out, "w");
 	if (!fp) error("Error creating output file: %s\n", arg->out);
 	fputs(header, fp);
 	fputc('\n', fp);
 	faidx_t *fai = fai_load(arg->ref); assert(fai);
-	// prepare to read bam
-	aux_t *data = calloc(1, sizeof(aux_t)); assert(data);
-	data->fp = bam_open(arg->in, "r"); assert(data->fp);
-	data->hdr = bam_hdr_read(data->fp); assert(data->hdr);
-	data->min_len = MIN_QLEN;
-	data->min_mapq = MIN_MAPQ;
-	bam_hdr_t *h = data->hdr;
-	pileup(data, fp, fai, bed, arg->max_dep, arg->min_dep, arg->biallelic);
-	// infer depth
-	bam_hdr_destroy(data->hdr);
-	bam_close(data->fp);
+
+	hts_tpool *proc = hts_tpool_init(arg->thread);
+	hts_tpool_process *que = hts_tpool_process_init(proc, arg->thread * 2, 1);
+	// dispatch jobs
+	bed_reglist_t *p;
+	reghash_t *h = (reghash_t *)bed;
+	for (khint_t k = kh_begin(h); k != kh_end(h); ++k)
+	{
+		if (kh_exist(h,k) && (p = &kh_val(h,k)) != NULL && p->n > 0)
+		{
+			const char *chr = kh_key(h, k);
+			for (int i = 0; i < p->n; ++i)
+			{
+				par_t *par = calloc(1, sizeof(par_t));
+				par->arg = arg;
+				par->out = fp;
+				par->fai = fai;
+				asprintf(&par->reg, "%s:%d-%d", chr,  (uint32_t)(p->a[i]>>32) + 1, (uint32_t)(p->a[i]));
+				hts_tpool_dispatch(proc, que, gps, par);
+			}
+		}
+	}
+	hts_tpool_process_flush(que);
+	hts_tpool_process_destroy(que);
+	hts_tpool_destroy(proc);
+	fai_destroy(fai);
 	bed_destroy(bed);
 	fclose(fp);
 	free(arg);
@@ -234,15 +290,9 @@ int read_bam(void *data, bam1_t *b)
 	int ret;
 	while (1)
 	{
-		ret = bam_read1(aux->fp, b);
-		if (ret < 0)
-			break;
-		if (b->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP))
-			continue;
-		if ((int)b->core.qual < aux->min_mapq)
-			continue;
-		if (bam_cigar2qlen(&b->core, bam_get_cigar(b)) < aux->min_len)
-			continue;
+		ret = sam_itr_next(aux->fp, aux->itr, b);
+		if (ret < 0) break;
+		if (b->core.flag & BAM_FILTER) continue;
 		break;
 	}
 	return ret;
@@ -265,24 +315,35 @@ char *get_id_seq(const bam_pileup1_t *p)
 	return seq;
 }
 
-void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, const int min_dep, const int biallelic)
+void *gps(void *par)
 {
 	khint_t k;
-	int i, l = 0, tid = 0, pos = 0, n_plp = 0, r = 0;
-	khash_t(map) *mi = kh_init(map);
-	khash_t(map) *md = kh_init(map);
-	bam_hdr_t *h = data->hdr;
+	int tid = 0, beg, end, pos = 0;
+	int i, l = 0, n_plp = 0, r = 0;
+	kstring_t iseq = {0, 0, 0}, dseq = {0, 0, 0};
+	khash_t(map) *mi = kh_init(map), *md = kh_init(map);
+
+	par_t *p = (par_t *)par;
+	aux_t *data = calloc(1, sizeof(aux_t)); assert(data);
+	data->fp = hts_open(p->arg->in, "r"); assert(data->fp);
+	data->hdr = sam_hdr_read(data->fp); assert(data->hdr);
+	data->idx = sam_index_load(data->fp, p->arg->in); assert(data->idx);
+	data->itr = sam_itr_querys(data->idx, data->hdr, p->reg); assert(data->itr);
+	hts_idx_destroy(data->idx);
+	beg = data->itr->beg;
+	end = data->itr->end;
 	const bam_pileup1_t *plp = calloc(1, sizeof(bam_pileup1_t)); assert(plp);
 	bam_mplp_t mplp = bam_mplp_init(1, read_bam, (void **)&data);
-	bam_mplp_set_maxcnt(mplp, max_dep);
-	kstring_t iseq = {0, 0, 0}, dseq = {0, 0, 0};
-	while (bam_mplp_auto(mplp, &tid, &pos, &n_plp, &plp) > 0) // pos: 0-based
+	bam_mplp_set_maxcnt(mplp, p->arg->max_dep);
+	//faidx_t *fai = fai_load(p->arg->ref); assert(fai);
+	while (bam_mplp_auto(mplp, &tid, &pos, &n_plp, &plp) > 0)
 	{
-		if (n_plp < min_dep) continue;
-		if (!bed_overlap(bed, h->target_name[tid], pos, pos + 1))
-			continue;
+		if (pos < beg) continue;
+		if (pos >= end) break;
+		if (tid >= data->hdr->n_targets) continue;
+		if (n_plp < p->arg->min_dep) continue;
 		// reference sequence
-		unsigned nt[5] = {0}, idl[2] = {0}, gap = 0;
+		int nt[5] = {0}, idl[2] = {0}, gap = 0;
 		for (i = 0; i < n_plp; ++i)
 		{
 			char *seq = 0;
@@ -335,24 +396,22 @@ void pileup(aux_t *data, FILE *fp, faidx_t *fai, void *bed, const int max_dep, c
 		}
 		else
 			kputs("0", &dseq);
-		if (biallelic)
+		if (p->arg->biallelic)
 		{
 			if ((nt[0]>0) + (nt[1]>0) + (nt[2]>0) + (nt[3]>0) + count_chars(iseq.s, ':') + count_chars(dseq.s, ':') > 2)
 				goto cleanup;
 		}
 		// output info
-		char *ref = faidx_fetch_seq(fai, h->target_name[tid], pos, pos, &l);
-		fprintf(fp, "%s\t", h->target_name[tid]);
-		fprintf(fp, "%d\t", pos + 1);
-		fprintf(fp, "%d\t", n_plp - gap);
-		fprintf(fp, "%s\t", ref);
-		fprintf(fp, "%d\t", nt[0]);
-		fprintf(fp, "%d\t", nt[1]);
-		fprintf(fp, "%d\t", nt[2]);
-		fprintf(fp, "%d\t", nt[3]);
-		fprintf(fp, "%d\t", nt[4]);
-		fprintf(fp, "%s\t", iseq.s);
-		fprintf(fp, "%s\n", dseq.s);
+		char *ref = faidx_fetch_seq(p->fai, data->hdr->target_name[tid], pos, pos, &l);
+		char *rec = 0;
+		asprintf(&rec, "%s\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n",
+				data->hdr->target_name[tid], pos + 1, n_plp - gap, ref,
+				nt[0], nt[1], nt[2], nt[3], nt[4], iseq.s, dseq.s);
+		// lock
+		pthread_mutex_lock(&mtx);
+		fputs(rec, p->out);
+		pthread_mutex_unlock(&mtx);
+		free(rec);
 		free(ref);
 cleanup:
 		EMPTY_HASH(map, mi);
@@ -360,6 +419,13 @@ cleanup:
 		iseq.l = dseq.l = 0;
 	}
 	bam_mplp_destroy(mplp);
+	bam_hdr_destroy(data->hdr);
+	hts_itr_destroy(data->itr);
+	hts_close(data->fp);
+	free(data);
+	free(p->reg);
+	free(p);
+	return NULL;
 }
 
 void usage(char *str)
@@ -371,11 +437,12 @@ void usage(char *str)
 	fprintf(stderr, "    -i --in         [STR]  Input bam\n");
 	fprintf(stderr, "    -o --out        [STR]  Output pileup summary\n");
 	fprintf(stderr, "    -r --ref        [STR]  Reference fa\n");
-	fprintf(stderr, "    -R --reg        [STR]  Region of interest\n");
+	fprintf(stderr, "    -R --reg        [STR]  Regions of interest\n");
 	fprintf(stderr, "\n  Optional:\n");
-	fprintf(stderr, "    -M --max_dep    [INT]  Max depth of coverage (8000)\n");
+	fprintf(stderr, "    -M --max_dep    [INT]  Max depth of coverage (10000)\n");
 	fprintf(stderr, "    -m --min_dep    [INT]  Min depth of coverage (10)\n");
 	fprintf(stderr, "    -b --biallelic  [BOOL] Restrict alleles to biallelic (false)\n");
+	fprintf(stderr, "    -t --thread     [INT]  Number of threads (1)\n");
 	fputc('\n', stderr);
 	fprintf(stderr, "    -v --version          Show version\n");
 	fprintf(stderr, "    -h --help             Show help message\n");
