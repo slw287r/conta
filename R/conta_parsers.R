@@ -95,11 +95,14 @@ write_data_table <- function(out, out_file, header = TRUE, sep = "\t", ...) {
 #' @param file_rev tsv file containing SNP counts for reverse strand
 #' @param baseline tsv file with blacklist and noise model
 #' @param default_het_mean default heterozygote allele frequency mean
+#' @param default_het_sum default heterozygote allele frequency alpha + beta
+#'     from beta binomial alternative formulation
 #' @return data.table containing counts and metrics per SNP
 #'
 #' @export
 read_and_prep <- function(file, file_rev = NA, baseline = NA,
-                          default_het_mean = 0.43) {
+                          default_het_mean = 0.43,
+                          default_het_sum = 200) {
 
   dat <- read_data_table(file, stop_if_missing = TRUE)
 
@@ -111,11 +114,8 @@ read_and_prep <- function(file, file_rev = NA, baseline = NA,
   }
 
   # Set chromosome as factors
-  dat$chrom <- gsub("Chr", "", gsub("chr", "", dat$chrom))
-  dat$chrom <- factor(dat$chrom, levels = c("1", "2", "3", "4", "5", "6", "7",
-                                            "8", "9", "10", "11", "12", "13",
-                                            "14", "15", "16", "17", "18", "19",
-                                            "20", "21", "22", "X", "Y"))
+
+  dat <- factorize_chroms(dat)
 
   # Remove blacklisted SNPs if provided
   required_columns <- c("blacklist", "rsid")
@@ -132,16 +132,20 @@ read_and_prep <- function(file, file_rev = NA, baseline = NA,
                   "Required columns:", paste(required_columns, collapse = ", ")))
   }
 
-  # Add mean for heterozygote SNPs if provided
-  optional_het_mean_column <- c("het_mean")
-  if (optional_het_mean_column %in% colnames(baseline)) {
+  # Add mean and sum for heterozygote SNPs if provided
+  optional_beta_binomial_columns <- c("alpha", "beta")
+  if (all(optional_beta_binomial_columns %in% colnames(baseline))) {
     dat <- dat %>%
-      left_join(baseline %>% dplyr::select(rsid, het_mean), by = c("rsid"))
+      left_join(baseline %>% dplyr::select(rsid, alpha, beta), by = c("rsid"))
     dat <- dat %>%
-      dplyr::mutate(het_mean = ifelse(is.na(het_mean), default_het_mean, het_mean))
+      dplyr::mutate(het_mean = ifelse(is.na(alpha) | is.na(beta),
+                                      default_het_mean, alpha / (alpha + beta)),
+                    het_sum = ifelse(is.na(alpha) | is.na(beta),
+                                     default_het_sum, alpha + beta))
 
   } else {
     dat$het_mean <- default_het_mean
+    dat$het_sum <- default_het_sum
   }
 
   # Return if data.table is empty
