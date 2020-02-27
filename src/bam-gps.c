@@ -9,6 +9,8 @@
 #include <assert.h>
 #include <libgen.h>
 #include <ctype.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <getopt.h>
 #include <sys/stat.h>
 #include <zlib.h>
@@ -17,6 +19,7 @@
 #include <bedidx.h>
 #include <htslib/hts.h>
 #include <htslib/sam.h>
+#include <htslib/bgzf.h>
 #include <htslib/faidx.h>
 #include <htslib/kfunc.h>
 #include <htslib/khash.h>
@@ -80,10 +83,16 @@ typedef struct
 
 typedef struct
 {
+	uint64_t id;
+	char *str;
+} buf_t;
+
+typedef struct
+{
 	char *reg;
-	FILE *out;
 	arg_t *arg;
 	faidx_t *fai;
+	buf_t *buf;
 } par_t;
 
 struct option long_options[] =
@@ -112,6 +121,7 @@ void val_arg(const arg_t *);
 void _mkdir(const char *dir);
 void usage(char *s);
 int read_bam(void *data, bam1_t *b);
+int buf_cmp (void const *a, void const *b);
 void *gps(void *par);
 
 int main(int argc, char *argv[])
@@ -181,10 +191,6 @@ int main(int argc, char *argv[])
 	void *bed = bed_read(arg->reg);
 	if (!bed) error("Failed to read region file %s\n", arg->reg);
 	bed_unify(bed);
-	FILE *fp = fopen(arg->out, "w");
-	if (!fp) error("Error creating output file: %s\n", arg->out);
-	fputs(header, fp);
-	fputc('\n', fp);
 	faidx_t *fai = fai_load(arg->ref); assert(fai);
 
 	hts_tpool *proc = hts_tpool_init(arg->thread);
@@ -192,17 +198,22 @@ int main(int argc, char *argv[])
 	// dispatch jobs
 	bed_reglist_t *p;
 	reghash_t *h = (reghash_t *)bed;
+	uint64_t m = 0, n = 0;
+	for (khint_t k = kh_begin(h); k != kh_end(h); ++k)
+		if (kh_exist(h,k) && (p = &kh_val(h,k)) != NULL && p->n > 0)
+			m += p->n;
+	buf_t *buf = calloc(m, sizeof(buf_t)); assert(buf);
 	for (khint_t k = kh_begin(h); k != kh_end(h); ++k)
 	{
 		if (kh_exist(h,k) && (p = &kh_val(h,k)) != NULL && p->n > 0)
 		{
 			const char *chr = kh_key(h, k);
-			for (int i = 0; i < p->n; ++i)
+			for (i = 0; i < p->n; ++i)
 			{
 				par_t *par = calloc(1, sizeof(par_t));
 				par->arg = arg;
-				par->out = fp;
 				par->fai = fai;
+				par->buf = buf + n++;
 				asprintf(&par->reg, "%s:%d-%d", chr,  (uint32_t)(p->a[i]>>32) + 1, (uint32_t)(p->a[i]));
 				hts_tpool_dispatch(proc, que, gps, par);
 			}
@@ -213,6 +224,25 @@ int main(int argc, char *argv[])
 	hts_tpool_destroy(proc);
 	fai_destroy(fai);
 	bed_destroy(bed);
+
+	BGZF *in = bgzf_open(arg->in, "r"); assert(in);
+	bam_hdr_t *hdr = bam_hdr_read(in);
+	qsort(buf, n, sizeof(buf_t), buf_cmp);
+	FILE *fp = fopen(arg->out, "w");
+	if (!fp) error("Error creating output file: %s\n", arg->out);
+	fputs(header, fp);
+	fputc('\n', fp);
+	for (i = 0; i < n; ++i)
+	{
+		if ((buf + i)->id)
+		{
+			fprintf(fp, "%s\t%d\t%s", hdr->target_name[(buf + i)->id >> 32], (uint32_t)(buf + i)->id + 1, (buf + i)->str);
+			free((buf + i)->str);
+		}
+	}
+	bgzf_close(in);
+	bam_hdr_destroy(hdr);
+	free(buf);
 	fclose(fp);
 	free(arg);
 	return 0;
@@ -315,6 +345,11 @@ char *get_id_seq(const bam_pileup1_t *p)
 	return seq;
 }
 
+int buf_cmp (void const *a, void const *b)
+{
+	return (*(buf_t *)b).id > (*(buf_t *)a).id ? -1 : 1;
+}
+
 void *gps(void *par)
 {
 	khint_t k;
@@ -335,7 +370,6 @@ void *gps(void *par)
 	const bam_pileup1_t *plp = calloc(1, sizeof(bam_pileup1_t)); assert(plp);
 	bam_mplp_t mplp = bam_mplp_init(1, read_bam, (void **)&data);
 	bam_mplp_set_maxcnt(mplp, p->arg->max_dep);
-	//faidx_t *fai = fai_load(p->arg->ref); assert(fai);
 	while (bam_mplp_auto(mplp, &tid, &pos, &n_plp, &plp) > 0)
 	{
 		if (pos < beg) continue;
@@ -377,6 +411,7 @@ void *gps(void *par)
 			++nt[seq_nt16_int[seq_nt16_table[(int)bam_nt16_rev_table[bam1_seqi((char *)bam1_seq(p->b), p->qpos)]]]];
 			if (seq) free (seq);
 		}
+		if (n_plp - gap < p->arg->min_dep) continue;
 		// summarize indels
 		if (kh_size(mi))
 		{
@@ -402,16 +437,15 @@ void *gps(void *par)
 				goto cleanup;
 		}
 		// output info
-		char *ref = faidx_fetch_seq(p->fai, data->hdr->target_name[tid], pos, pos, &l);
-		char *rec = 0;
-		asprintf(&rec, "%s\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n",
-				data->hdr->target_name[tid], pos + 1, n_plp - gap, ref,
-				nt[0], nt[1], nt[2], nt[3], nt[4], iseq.s, dseq.s);
-		// lock
+		/*
+		 * https://github.com/samtools/htslib/issues/404#issuecomment-251434613
+		 */
 		pthread_mutex_lock(&mtx);
-		fputs(rec, p->out);
+		char *ref = faidx_fetch_seq(p->fai, data->hdr->target_name[tid], pos, pos, &l);
 		pthread_mutex_unlock(&mtx);
-		free(rec);
+		p->buf->id = (uint64_t)tid << 32 | pos;
+		asprintf(&p->buf->str, "%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", n_plp - gap, ref,
+				nt[0], nt[1], nt[2], nt[3], nt[4], iseq.s, dseq.s);
 		free(ref);
 cleanup:
 		EMPTY_HASH(map, mi);
@@ -442,7 +476,7 @@ void usage(char *str)
 	fprintf(stderr, "    -M --max_dep    [INT]  Max depth of coverage (10000)\n");
 	fprintf(stderr, "    -m --min_dep    [INT]  Min depth of coverage (10)\n");
 	fprintf(stderr, "    -b --biallelic  [BOOL] Restrict alleles to biallelic (false)\n");
-	fprintf(stderr, "    -t --thread     [INT]  Number of threads (1)\n");
+	fprintf(stderr, "    -t --thread     [INT]  Number of threads (8)\n");
 	fputc('\n', stderr);
 	fprintf(stderr, "    -v --version          Show version\n");
 	fprintf(stderr, "    -h --help             Show help message\n");
