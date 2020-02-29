@@ -27,7 +27,7 @@
 #include <htslib/thread_pool.h>
 #include <pthread.h>
 
-#define version "0.2.0"
+#define version "0.2.1"
 #define MAX_DEP 10000
 #define MIN_DEP 10
 #define MIN_MAPQ 50
@@ -47,7 +47,6 @@ typedef struct {
 
 KHASH_MAP_INIT_STR(reg, bed_reglist_t)
 typedef khash_t(reg) reghash_t;
-//KHASH_SET_INIT_STR(set)
 
 #define EMPTY_HASH(type, hash) do                 \
 {                                                 \
@@ -67,10 +66,8 @@ KHASH_MAP_INIT_STR(map, int)
 
 typedef struct
 {
-	samFile *fp;
-	bam_hdr_t *hdr;
+	htsFile *fp;
 	hts_itr_t *itr;
-	hts_idx_t *idx;
 	int min_mapq, min_qlen;
 } aux_t;
 
@@ -91,6 +88,8 @@ typedef struct
 {
 	char *reg;
 	arg_t *arg;
+	bam_hdr_t *hdr;
+	hts_idx_t *idx;
 	faidx_t *fai;
 	buf_t *buf;
 } par_t;
@@ -187,11 +186,15 @@ int main(int argc, char *argv[])
 	val_arg(arg);
 	char *output = strdup(arg->out);
 	_mkdir(dirname(output));
-	//free(output);
+	free(output);
 	void *bed = bed_read(arg->reg);
 	if (!bed) error("Failed to read region file %s\n", arg->reg);
 	bed_unify(bed);
 	faidx_t *fai = fai_load(arg->ref); assert(fai);
+
+	htsFile *in = hts_open(arg->in, "r"); assert(in);
+	bam_hdr_t *hdr = sam_hdr_read(in); assert(hdr);
+	hts_idx_t *idx = bam_index_load(arg->in); assert(idx);
 
 	hts_tpool *proc = hts_tpool_init(arg->thread);
 	hts_tpool_process *que = hts_tpool_process_init(proc, arg->thread * 2, 1);
@@ -205,7 +208,7 @@ int main(int argc, char *argv[])
 	buf_t *buf = calloc(m, sizeof(buf_t)); assert(buf);
 	for (khint_t k = kh_begin(h); k != kh_end(h); ++k)
 	{
-		if (kh_exist(h,k) && (p = &kh_val(h,k)) != NULL && p->n > 0)
+		if (kh_exist(h,k) && (p = &kh_val(h,k)) && p->n > 0)
 		{
 			const char *chr = kh_key(h, k);
 			for (i = 0; i < p->n; ++i)
@@ -213,8 +216,10 @@ int main(int argc, char *argv[])
 				par_t *par = calloc(1, sizeof(par_t));
 				par->arg = arg;
 				par->fai = fai;
+				par->hdr = hdr;
+				par->idx = idx;
 				par->buf = buf + n++;
-				asprintf(&par->reg, "%s:%d-%d", chr,  (uint32_t)(p->a[i]>>32) + 1, (uint32_t)(p->a[i]));
+				asprintf(&par->reg, "%s:%d-%d", chr, (uint32_t)(p->a[i]>>32) + 1, (uint32_t)(p->a[i]>>32) + 1);
 				hts_tpool_dispatch(proc, que, gps, par);
 			}
 		}
@@ -223,24 +228,24 @@ int main(int argc, char *argv[])
 	hts_tpool_process_destroy(que);
 	hts_tpool_destroy(proc);
 	fai_destroy(fai);
+	hts_close(in);
+	hts_idx_destroy(idx);
 	bed_destroy(bed);
 
-	BGZF *in = bgzf_open(arg->in, "r"); assert(in);
-	bam_hdr_t *hdr = bam_hdr_read(in);
-	qsort(buf, n, sizeof(buf_t), buf_cmp);
 	FILE *fp = fopen(arg->out, "w");
 	if (!fp) error("Error creating output file: %s\n", arg->out);
 	fputs(header, fp);
 	fputc('\n', fp);
+
+	qsort(buf, n, sizeof(buf_t), buf_cmp);
 	for (i = 0; i < n; ++i)
 	{
-		if ((buf + i)->id)
+		if ((buf + i)->id > 0)
 		{
 			fprintf(fp, "%s\t%d\t%s", hdr->target_name[(buf + i)->id >> 32], (uint32_t)(buf + i)->id + 1, (buf + i)->str);
 			free((buf + i)->str);
 		}
 	}
-	bgzf_close(in);
 	bam_hdr_destroy(hdr);
 	free(buf);
 	fclose(fp);
@@ -296,22 +301,20 @@ size_t count_chars(char* s, char c)
 
 void _mkdir(const char *dir)
 {
-	char tmp[PATH_MAX];
-	char *p = NULL;
-	size_t len;
-	snprintf(tmp, sizeof(tmp),"%s",dir);
-	len = strlen(tmp);
-	if(tmp[len - 1] == '/') tmp[len - 1] = 0;
-	for(p = tmp + 1; *p; p++)
+	char *q = strdup(dir), *p = NULL;
+	size_t l = strlen(q);
+	if (q[l - 1] == '/') q[l - 1] = 0;
+	for (p = q + 1; *p; ++p)
 	{
 		if(*p == '/')
 		{
 			*p = 0;
-			mkdir(tmp, (S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH));
+			mkdir(q, (S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH));
 			*p = '/';
 		}
 	}
-	mkdir(tmp, (S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH));
+	mkdir(q, (S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH));
+	free(q);
 }
 
 int read_bam(void *data, bam1_t *b)
@@ -338,10 +341,10 @@ int read_bam(void *data, bam1_t *b)
 char *get_id_seq(const bam_pileup1_t *p)
 {
 	int i = 0, l = abs(p->indel);
-	char *seq = calloc(l, sizeof(char)); assert(seq);
-	for (i = 1; i <= l; ++i) // w/ leading anchor base
-		seq[i - 1] = seq_nt16_str[bam_seqi(bam_get_seq(p->b), p->qpos + i)];
-	seq[i - 1] = '\0';
+	char *seq = calloc(l + 2, sizeof(char)); assert(seq);
+	for (i = 0; i <= l; ++i) // w/ leading anchor base
+		seq[i] = seq_nt16_str[bam_seqi(bam_get_seq(p->b), p->qpos + i)];
+	seq[i] = '\0';
 	return seq;
 }
 
@@ -353,63 +356,64 @@ int buf_cmp (void const *a, void const *b)
 void *gps(void *par)
 {
 	khint_t k;
-	int tid = 0, beg, end, pos = 0;
-	int i, l = 0, n_plp = 0, r = 0;
+	char *seq = 0;
+	int tid = 0, beg = -1, end = INT_MAX, pos = 0;
+	int i, n_plp = 0, r = 0;
+	// insertion and deletion sequences
 	kstring_t iseq = {0, 0, 0}, dseq = {0, 0, 0};
 	khash_t(map) *mi = kh_init(map), *md = kh_init(map);
 
 	par_t *p = (par_t *)par;
-	aux_t *data = calloc(1, sizeof(aux_t)); assert(data);
-	data->fp = hts_open(p->arg->in, "r"); assert(data->fp);
-	data->hdr = sam_hdr_read(data->fp); assert(data->hdr);
-	data->idx = sam_index_load(data->fp, p->arg->in); assert(data->idx);
-	data->itr = sam_itr_querys(data->idx, data->hdr, p->reg); assert(data->itr);
-	hts_idx_destroy(data->idx);
-	beg = data->itr->beg;
-	end = data->itr->end;
-	const bam_pileup1_t *plp = calloc(1, sizeof(bam_pileup1_t)); assert(plp);
-	bam_mplp_t mplp = bam_mplp_init(1, read_bam, (void **)&data);
+	aux_t *aux = calloc(1, sizeof(aux_t)); assert(aux);
+	aux->fp = hts_open(p->arg->in, "r"); assert(aux->fp);
+	aux->itr = sam_itr_querys(p->idx, p->hdr, p->reg); assert(aux->itr);
+	beg = aux->itr->beg;
+	end = aux->itr->end;
+	const bam_pileup1_t *plp = NULL;
+	bam_mplp_t mplp = bam_mplp_init(1, read_bam, (void **)&aux);
 	bam_mplp_set_maxcnt(mplp, p->arg->max_dep);
 	while (bam_mplp_auto(mplp, &tid, &pos, &n_plp, &plp) > 0)
 	{
 		if (pos < beg) continue;
 		if (pos >= end) break;
-		if (tid >= data->hdr->n_targets) continue;
+		if (tid >= p->hdr->n_targets) continue;
 		if (n_plp < p->arg->min_dep) continue;
 		// reference sequence
 		int nt[5] = {0}, idl[2] = {0}, gap = 0;
 		for (i = 0; i < n_plp; ++i)
 		{
-			char *seq = 0;
 			const bam_pileup1_t *p = plp + i;
 			if (p->indel) seq = get_id_seq(p);
 			if (p->indel > 0)
 			{
 				if ((k = kh_get(map, mi, seq)) == kh_end(mi))
 				{
-					k = kh_put(map, mi, strdup(seq), &r);
+					k = kh_put(map, mi, seq, &r);
 					kh_val(mi, k) = 1;
 				}
 				else
+				{
 					++kh_val(mi, k);
+					free(seq);
+				}
 			}
 			if (p->indel < 0)
 			{
 				if ((k = kh_get(map, md, seq)) == kh_end(md))
 				{
-					k = kh_put(map, md, strdup(seq), &r);
+					k = kh_put(map, md, seq, &r);
 					kh_val(md, k) = 1;
 				}
 				else
+				{
 					++kh_val(md, k);
+					free(seq);
+				}
 			}
 			if (p->is_del || p->is_refskip)
-			{
 				++gap;
-				continue;
-			}
-			++nt[seq_nt16_int[seq_nt16_table[(int)bam_nt16_rev_table[bam1_seqi((char *)bam1_seq(p->b), p->qpos)]]]];
-			if (seq) free (seq);
+			else
+				++nt[seq_nt16_int[seq_nt16_table[(int)bam_nt16_rev_table[bam1_seqi((char *)bam1_seq(p->b), p->qpos)]]]];
 		}
 		if (n_plp - gap < p->arg->min_dep) continue;
 		// summarize indels
@@ -432,16 +436,13 @@ void *gps(void *par)
 		else
 			kputs("0", &dseq);
 		if (p->arg->biallelic)
-		{
-			if ((nt[0]>0) + (nt[1]>0) + (nt[2]>0) + (nt[3]>0) + count_chars(iseq.s, ':') + count_chars(dseq.s, ':') > 2)
+			if ((nt[0]>0) + (nt[1]>0) + (nt[2]>0) + (nt[3]>0) +
+					count_chars(iseq.s, ':') + count_chars(dseq.s, ':') > 2)
 				goto cleanup;
-		}
 		// output info
-		/*
-		 * https://github.com/samtools/htslib/issues/404#issuecomment-251434613
-		 */
+		// https://github.com/samtools/htslib/issues/404#issuecomment-251434613
 		pthread_mutex_lock(&mtx);
-		char *ref = faidx_fetch_seq(p->fai, data->hdr->target_name[tid], pos, pos, &l);
+		char *ref = faidx_fetch_seq(p->fai, p->hdr->target_name[tid], pos, pos, &r);
 		pthread_mutex_unlock(&mtx);
 		p->buf->id = (uint64_t)tid << 32 | pos;
 		asprintf(&p->buf->str, "%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", n_plp - gap, ref,
@@ -453,13 +454,11 @@ cleanup:
 		iseq.l = dseq.l = 0;
 	}
 	bam_mplp_destroy(mplp);
-	bam_hdr_destroy(data->hdr);
-	hts_itr_destroy(data->itr);
-	hts_close(data->fp);
-	free(data);
+	hts_itr_destroy(aux->itr);
+	hts_close(aux->fp);
+	free(aux);
 	free(p->reg);
 	free(p);
-	return NULL;
 }
 
 void usage(char *str)
